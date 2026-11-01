@@ -1,0 +1,153 @@
+# Required GitLab CI/CD variables: VITE_APPNAME, BASE_URL, VITE_BEURL,
+# VITE_RECAPTCHAKEY, DB_DATABASE, DB_USERNAME, DB_PASSWORD, FTP_HOST,
+# FTP_USERNAME, FTP_PASSWORD, SSH_HOST, SSH_USER, SSH_PRIVATE_KEY.
+# FTP_REMOTE_DIR and SSH_ARCHIVE_DIR must point to the same server directory.
+# Optional: FTP_PORT, SSH_PORT, SSH_DEPLOY_PATH, SSH_KNOWN_HOSTS, APP_KEY,
+# APP_URL, DB_HOST, DB_PORT. APP_KEY defaults to the value in be/.env.mysql.
+stages:
+  - composer
+  - package
+  - deploy
+
+composer_install:
+  stage: composer
+  image: composer:2
+  script:
+    - cd be
+    - composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader
+  artifacts:
+    paths:
+      - be/vendor/
+    expire_in: 1 day
+
+package_release:
+  stage: package
+  image: node:20-bookworm-slim
+  needs:
+    - job: composer_install
+      artifacts: true
+  script:
+    - ': "${VITE_APPNAME:?Set the VITE_APPNAME GitLab CI/CD variable}"'
+    - ': "${BASE_URL:?Set the BASE_URL GitLab CI/CD variable}"'
+    - ': "${VITE_BEURL:?Set the VITE_BEURL GitLab CI/CD variable}"'
+    - ': "${VITE_RECAPTCHAKEY:?Set the VITE_RECAPTCHAKEY GitLab CI/CD variable}"'
+    - ': "${DB_DATABASE:?Set the DB_DATABASE GitLab CI/CD variable}"'
+    - ': "${DB_USERNAME:?Set the DB_USERNAME GitLab CI/CD variable}"'
+    - ': "${DB_PASSWORD:?Set the DB_PASSWORD GitLab CI/CD variable}"'
+    - cd fe
+    - npm install
+    - cd ..
+    - |
+      node <<'NODE'
+      const fs = require("node:fs");
+
+      const quote = (value) => JSON.stringify(String(value ?? ""));
+      const frontendEnv = [
+        ["VITE_APPNAME", process.env.VITE_APPNAME],
+        ["BASE_URL", process.env.BASE_URL],
+        ["VITE_BEURL", process.env.VITE_BEURL],
+        ["VITE_RECAPTCHAKEY", process.env.VITE_RECAPTCHAKEY],
+      ].map(([key, value]) => `${key}=${quote(value)}`).join("\n") + "\n";
+      fs.writeFileSync("fe/.env.production", frontendEnv);
+
+      const template = fs.readFileSync("be/.env.mysql", "utf8");
+      const templateValue = (key, fallback = "") => {
+        const match = template.match(new RegExp(`^${key}=(.*)$`, "m"));
+        return match ? match[1] : fallback;
+      };
+      const replacedKeys = new Set([
+        "APP_NAME", "APP_ENV", "APP_KEY", "APP_DEBUG", "APP_URL", "LOG_LEVEL",
+        "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_DATABASE", "DB_USERNAME", "DB_PASSWORD",
+      ]);
+      const preservedLines = template.split(/\r?\n/).filter((line) => {
+        const match = line.match(/^([A-Z0-9_]+)=/);
+        return !match || !replacedKeys.has(match[1]);
+      });
+      const backendValues = [
+        ["APP_NAME", process.env.VITE_APPNAME],
+        ["APP_ENV", "production"],
+        ["APP_KEY", process.env.APP_KEY || templateValue("APP_KEY")],
+        ["APP_DEBUG", "false"],
+        ["APP_URL", process.env.APP_URL || process.env.VITE_BEURL],
+        ["LOG_LEVEL", "error"],
+        ["DB_CONNECTION", "mysql"],
+        ["DB_HOST", process.env.DB_HOST || templateValue("DB_HOST", "127.0.0.1")],
+        ["DB_PORT", process.env.DB_PORT || templateValue("DB_PORT", "3306")],
+        ["DB_DATABASE", process.env.DB_DATABASE],
+        ["DB_USERNAME", process.env.DB_USERNAME],
+        ["DB_PASSWORD", process.env.DB_PASSWORD],
+      ].map(([key, value]) => `${key}=${quote(value)}`);
+      fs.writeFileSync("be/.env", `${preservedLines.join("\n").trimEnd()}\n${backendValues.join("\n")}\n`, { mode: 0o600 });
+      fs.chmodSync("be/.env", 0o600);
+      NODE
+    - npm --prefix fe run lb
+    - tar -czf release.tar.gz -C be --exclude=./.env.mysql --exclude=./.env.psql .
+  artifacts:
+    paths:
+      - release.tar.gz
+    expire_in: 1 day
+
+deploy_hostinger:
+  stage: deploy
+  image: alpine:3.20
+  needs:
+    - job: package_release
+      artifacts: true
+  before_script:
+    - apk add --no-cache curl openssh-client
+  script:
+    - ': "${FTP_HOST:?Set the FTP_HOST GitLab CI/CD variable}"'
+    - ': "${FTP_USERNAME:?Set the FTP_USERNAME GitLab CI/CD variable}"'
+    - ': "${FTP_PASSWORD:?Set the FTP_PASSWORD GitLab CI/CD variable}"'
+    - ': "${SSH_HOST:?Set the SSH_HOST GitLab CI/CD variable}"'
+    - ': "${SSH_USER:?Set the SSH_USER GitLab CI/CD variable}"'
+    - ': "${SSH_PRIVATE_KEY:?Set the SSH_PRIVATE_KEY GitLab CI/CD variable}"'
+    - |
+      set -eu
+      FTP_PORT="${FTP_PORT:-21}"
+      FTP_REMOTE_DIR="${FTP_REMOTE_DIR:-public_html}"
+      SSH_PORT="${SSH_PORT:-22}"
+      SSH_DEPLOY_PATH="${SSH_DEPLOY_PATH:-public_html}"
+      SSH_ARCHIVE_DIR="${SSH_ARCHIVE_DIR:-public_html}"
+      REMOTE_ARCHIVE="release-${CI_PIPELINE_ID}.tar.gz"
+
+      for path in "$FTP_REMOTE_DIR" "$SSH_DEPLOY_PATH" "$SSH_ARCHIVE_DIR"; do
+        case "$path" in
+          ""|*[!A-Za-z0-9_./-]*) echo "Deployment paths may contain only letters, numbers, '.', '/', '_' and '-'." >&2; exit 1 ;;
+        esac
+      done
+
+      FTP_DIR="${FTP_REMOTE_DIR%/}"
+      curl --fail --show-error --silent --ftp-ssl-reqd --ftp-create-dirs \
+        --user "$FTP_USERNAME:$FTP_PASSWORD" \
+        --upload-file release.tar.gz \
+        "ftp://$FTP_HOST:$FTP_PORT/$FTP_DIR/$REMOTE_ARCHIVE"
+
+      mkdir -p "$HOME/.ssh"
+      chmod 700 "$HOME/.ssh"
+      eval "$(ssh-agent -s)"
+      if [ -f "$SSH_PRIVATE_KEY" ]; then
+        ssh-add "$SSH_PRIVATE_KEY"
+      else
+        printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+      fi
+
+      if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+        if [ -f "$SSH_KNOWN_HOSTS" ]; then
+          cp "$SSH_KNOWN_HOSTS" "$HOME/.ssh/known_hosts"
+        else
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+        fi
+      else
+        ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+      fi
+      chmod 600 "$HOME/.ssh/known_hosts"
+
+      ssh -p "$SSH_PORT" \
+        -o BatchMode=yes \
+        -o StrictHostKeyChecking=yes \
+        "$SSH_USER@$SSH_HOST" \
+        "set -eu; archive='$SSH_ARCHIVE_DIR/$REMOTE_ARCHIVE'; mkdir -p '$SSH_DEPLOY_PATH'; tar -xzf \"\$archive\" -C '$SSH_DEPLOY_PATH'; rm -f \"\$archive\"; cd '$SSH_DEPLOY_PATH'; mkdir -p storage/framework/cache/data storage/framework/sessions storage/framework/testing storage/framework/views storage/logs bootstrap/cache public/uploads; php artisan migrate --force"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
